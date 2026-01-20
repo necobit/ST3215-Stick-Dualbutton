@@ -32,6 +32,20 @@
 #define SERVO3_SPEED 3000
 #define SERVO_ACC 200
 
+// Multi-turn position control
+#define MAX_STEP_PER_COMMAND 4096
+
+// SERVO1 position control settings
+#define SERVO1_STEP_AMOUNT 4096      // Steps per max trigger (1 rotation)
+#define SERVO1_MAX_THRESHOLD 60000   // Joystick value to trigger (near 65535)
+#define SERVO1_MIN_THRESHOLD 5000    // Joystick value to trigger (near 0)
+#define SERVO1_SLOW_SPEED 300        // Slow movement speed
+#define SERVO1_SLOW_STEPS 100        // Steps per slow movement
+#define SERVO1_HOLD_TIME 1000        // ms to wait before slow movement
+
+// SERVO3 position control settings
+#define SERVO3_TARGET 36000          // Target position in steps (約8.8回転)
+
 // Load monitoring
 #define LOAD_CHECK_INTERVAL 200 // ms
 #define LOAD_LIMIT 500          // 0-1000
@@ -40,31 +54,64 @@ SMS_STS sts;
 M5UnitJoystick2 joystick;
 
 // Previous speed to detect changes
-int16_t prevSpeed1 = 0;
 int16_t prevSpeed2 = 0;
 int prevPWMAngle = -1;
 
+// SERVO1 multi-turn position tracking
+long servo1TotalPos = 0;
+int servo1LastPos = 0;
+bool servo1MaxTriggered = false;      // True when max position triggered
+int8_t servo1MaxDirection = 0;        // Direction of max trigger (-1 or 1)
+unsigned long servo1HoldStart = 0;    // When hold started
+bool servo1Holding = false;           // True when holding in middle position
+
 // Servo 3 state:
 // 0=idle, 1=reverse(homing), 2=forward(homing complete)
-// 3=forward rotation, 4=wait 2sec, 5=reverse rotation, 6=wait before re-home
+// 3=moving to target, 4=wait at target, 5=returning to origin
 int servo3Phase = 0;
 unsigned long servo3StartTime = 0;
-int servo3HomePos = 0;
+long servo3TotalPos = 0;
 int servo3LastPos = 0;
-int servo3RotationCount = 0;
-int servo3ExtraStartPos = 0;
 #define SERVO3_INIT_SPEED 500
 #define SERVO3_LOAD_LIMIT 300
 #define SERVO3_FORWARD_TIME 1000 // ms (homing forward time)
-#define SERVO3_ROTATIONS 8       // Number of full rotations for button action
-#define SERVO3_EXTRA_STEPS 2800  // Extra steps after rotations (2048 = half rotation, 0 = none)
-#define SERVO3_WAIT_TIME 2000    // ms (wait time after rotation)
-#define SERVO3_RUN_SPEED 3000    // Wheel mode speed for rotation
+#define SERVO3_WAIT_TIME 2000    // ms (wait time at target)
+#define SERVO3_MOVE_SPEED 3000   // Position mode speed
 
 // Load monitoring state
 unsigned long lastLoadCheck = 0;
 bool servoOverLoad[3] = {false, false, false};
 int8_t overLoadDirection[3] = {0, 0, 0}; // Direction when overload occurred: 1=positive, -1=negative
+
+// Multi-turn position control: move steps (can exceed 4096)
+void moveSteps(u8 id, long steps, u16 speed, u8 acc)
+{
+  if (steps == 0)
+    return;
+
+  int direction = (steps > 0) ? 1 : -1;
+  long remaining = abs(steps);
+
+  while (remaining > 0)
+  {
+    int chunk = (remaining > MAX_STEP_PER_COMMAND) ? MAX_STEP_PER_COMMAND : remaining;
+    sts.WritePosEx(id, chunk * direction, speed, acc);
+    remaining -= chunk;
+    delay(2);
+  }
+}
+
+// Update total position from servo encoder (handles wrap-around)
+void updateTotalPos(u8 id, int currentPos, int &lastPos, long &totalPos)
+{
+  int delta = currentPos - lastPos;
+  if (delta > 2048)
+    delta -= 4096;
+  if (delta < -2048)
+    delta += 4096;
+  totalPos += delta;
+  lastPos = currentPos;
+}
 
 // Servo 3 home return (原点復帰)
 void servo3Home()
@@ -168,23 +215,41 @@ void setup()
     delay(50);
   }
 
-  // Disable angle limits for Servo 3 (enable multi-turn)
-  sts.unLockEprom(SERVO3_ID);
-  sts.writeWord(SERVO3_ID, 9, 0); // Min Limit = 0
-  sts.writeWord(SERVO3_ID, 10, 0);
-  sts.writeWord(SERVO3_ID, 11, 0); // Max Limit = 0
-  sts.writeWord(SERVO3_ID, 12, 0);
-  sts.LockEprom(SERVO3_ID);
-  Serial.println("Servo 3: Angle limits disabled");
+  // Disable angle limits and set Mode 3 for SERVO1 and SERVO3
+  int positionServoIds[] = {SERVO1_ID, SERVO3_ID};
+  for (int i = 0; i < 2; i++)
+  {
+    int id = positionServoIds[i];
+    Serial.print("Servo ");
+    Serial.print(id);
+    Serial.println(": Setting up multi-turn position control...");
 
-  // Set servos to wheel mode (continuous rotation)
-  Serial.println("Setting wheel mode...");
+    // Disable angle limits
+    sts.unLockEprom(id);
+    sts.writeByte(id, 9, 0);  // Min angle limit low byte
+    sts.writeByte(id, 10, 0); // Min angle limit high byte
+    sts.writeByte(id, 11, 0); // Max angle limit low byte
+    sts.writeByte(id, 12, 0); // Max angle limit high byte
+    sts.LockEprom(id);
+
+    // Set Mode 3 (Step mode)
+    sts.writeByte(id, 33, 3);
+    delay(50);
+  }
+
+  // SERVO2 stays in wheel mode
+  sts.WheelMode(SERVO2_ID);
+  Serial.println("Servo 2: Wheel mode");
+
+  // Initialize position tracking
+  servo1LastPos = sts.ReadPos(SERVO1_ID);
+  servo1TotalPos = 0;
+  servo3LastPos = sts.ReadPos(SERVO3_ID);
+  servo3TotalPos = 0;
+
   for (int i = 0; i < 3; i++)
   {
     int id = servoIds[i];
-    sts.WheelMode(id);
-    delay(50);
-
     int pos = sts.ReadPos(id);
     Serial.print("Servo ");
     Serial.print(id);
@@ -222,45 +287,77 @@ void loop()
   // Read joystick ADC values (16-bit)
   joystick.get_joy_adc_16bits_value_xy(&adc_x, &adc_y);
 
-  // Calculate speeds from joystick position
-  // X axis (left/right) controls Servo 1
-  // Y axis (up/down) controls Servo 2
-  int16_t speed1 = -mapJoystickToSpeed(adc_x, SERVO1_SPEED_MAX); // Inverted
+  // SERVO2: Y axis speed control (wheel mode)
   int16_t speed2 = mapJoystickToSpeed(adc_y, SERVO2_SPEED_MAX);
 
-  // Only move the axis with larger offset from center
+  // Check button state
+  bool buttonPressed = (digitalRead(BTN_ANGLE_70) == LOW) || (digitalRead(BTN_ANGLE_110) == LOW);
+
+  // SERVO1: X axis position control
+  // Update total position tracking
+  int servo1CurrentPos = sts.ReadPos(SERVO1_ID);
+  updateTotalPos(SERVO1_ID, servo1CurrentPos, servo1LastPos, servo1TotalPos);
+
+  // Check if joystick is at center
   int32_t offsetX = abs((int32_t)adc_x - JOY_CENTER);
-  int32_t offsetY = abs((int32_t)adc_y - JOY_CENTER);
-  if (offsetX > offsetY)
+  bool atCenter = (offsetX < JOY_DEADZONE);
+
+  // Check if joystick is at max
+  bool atMaxRight = (adc_x > SERVO1_MAX_THRESHOLD);
+  bool atMaxLeft = (adc_x < SERVO1_MIN_THRESHOLD);
+
+  if (atCenter)
   {
-    speed2 = 0;
+    // Reset trigger when returned to center
+    servo1MaxTriggered = false;
+    servo1MaxDirection = 0;
+    servo1Holding = false;
+    servo1HoldStart = 0;
   }
-  else
+  else if (!servo1MaxTriggered && !buttonPressed)
   {
-    speed1 = 0;
+    if (atMaxRight)
+    {
+      // Max right triggered - move positive
+      moveSteps(SERVO1_ID, SERVO1_STEP_AMOUNT, SERVO1_SPEED_MAX, SERVO_ACC);
+      servo1MaxTriggered = true;
+      servo1MaxDirection = 1;
+      servo1Holding = false;
+      Serial.print("Servo 1: Move +");
+      Serial.println(SERVO1_STEP_AMOUNT);
+    }
+    else if (atMaxLeft)
+    {
+      // Max left triggered - move negative
+      moveSteps(SERVO1_ID, -SERVO1_STEP_AMOUNT, SERVO1_SPEED_MAX, SERVO_ACC);
+      servo1MaxTriggered = true;
+      servo1MaxDirection = -1;
+      servo1Holding = false;
+      Serial.print("Servo 1: Move -");
+      Serial.println(SERVO1_STEP_AMOUNT);
+    }
+    else
+    {
+      // Middle position - start hold timer or slow move
+      if (!servo1Holding)
+      {
+        servo1Holding = true;
+        servo1HoldStart = millis();
+      }
+      else if (millis() - servo1HoldStart >= SERVO1_HOLD_TIME)
+      {
+        // Slow movement after 1 second hold
+        int8_t direction = (adc_x > JOY_CENTER) ? 1 : -1;
+        moveSteps(SERVO1_ID, SERVO1_SLOW_STEPS * direction, SERVO1_SLOW_SPEED, SERVO_ACC);
+        servo1HoldStart = millis(); // Reset for continuous slow movement
+      }
+    }
   }
 
-  // Update Servo 1 if speed changed (skip if button pressed or same direction as overload)
-  bool buttonPressed = (digitalRead(BTN_ANGLE_70) == LOW) || (digitalRead(BTN_ANGLE_110) == LOW);
-  if (buttonPressed)
+  // Only use Y axis if X axis is at center (avoid simultaneous movement)
+  if (!atCenter)
   {
-    speed1 = 0;
-  }
-  // Reset overload flag only when joystick returns to center
-  if (speed1 == 0 && servoOverLoad[0])
-  {
-    servoOverLoad[0] = false;
-    overLoadDirection[0] = 0;
-  }
-  // Block same direction as overload, allow reverse (load sign is opposite to speed)
-  if (servoOverLoad[0] && ((speed1 > 0 && overLoadDirection[0] < 0) || (speed1 < 0 && overLoadDirection[0] > 0)))
-  {
-    speed1 = 0;
-  }
-  if (speed1 != prevSpeed1)
-  {
-    sts.WriteSpe(SERVO1_ID, speed1, SERVO_ACC);
-    prevSpeed1 = speed1;
+    speed2 = 0;
   }
 
   // Reset overload flag only when joystick returns to center
@@ -280,113 +377,75 @@ void loop()
     prevSpeed2 = speed2;
   }
 
+  // SERVO3: Position control
+  // Update total position tracking
+  int servo3CurrentPos = sts.ReadPos(SERVO3_ID);
+  updateTotalPos(SERVO3_ID, servo3CurrentPos, servo3LastPos, servo3TotalPos);
+
   // Servo 3: Homing forward complete (phase 2) - switch to position mode
   if (servo3Phase == 2 && millis() - servo3StartTime >= SERVO3_FORWARD_TIME)
   {
     sts.WriteSpe(SERVO3_ID, 0, SERVO_ACC);
     delay(100);
 
-    // Set current position as 0
+    // Set current position as origin (0)
     sts.CalibrationOfs(SERVO3_ID);
     delay(50);
-    servo3HomePos = sts.ReadPos(SERVO3_ID);
+    servo3LastPos = sts.ReadPos(SERVO3_ID);
+    servo3TotalPos = 0;
     servo3Phase = 0;
-    Serial.print("Servo 3: Homing complete, HomePos=");
-    Serial.println(servo3HomePos);
+    Serial.print("Servo 3: Homing complete, TotalPos=");
+    Serial.println(servo3TotalPos);
   }
 
-  // Servo 3: Joystick button triggers rotation sequence
-  // Block if any other action is happening (buttons pressed, servos moving)
-  bool anyActivity = buttonPressed || (speed1 != 0) || (speed2 != 0);
+  // Servo 3: Joystick button triggers movement sequence
+  // Block if any other action is happening (buttons pressed, X axis active)
+  bool anyActivity = buttonPressed || !atCenter || (speed2 != 0);
   if (servo3Phase == 0 && joystick.get_button_value() == 0 && !anyActivity)
   {
-    // Start forward rotation with wheel mode
-    servo3RotationCount = 0;
-    servo3LastPos = sts.ReadPos(SERVO3_ID);
-    sts.WriteSpe(SERVO3_ID, SERVO3_RUN_SPEED, SERVO_ACC);
+    // Move to target position using position control
+    moveSteps(SERVO3_ID, SERVO3_TARGET, SERVO3_MOVE_SPEED, SERVO_ACC);
     servo3Phase = 3;
     servo3StartTime = millis();
-    Serial.print("Servo 3: Forward ");
-    Serial.print(SERVO3_ROTATIONS);
-    Serial.println(" rotations");
+    Serial.print("Servo 3: Moving to ");
+    Serial.println(SERVO3_TARGET);
   }
 
-  // Servo 3: Count rotations during forward (phase 3)
+  // Servo 3: Wait for movement to complete (phase 3)
   if (servo3Phase == 3)
   {
-    int currentPos = sts.ReadPos(SERVO3_ID);
-    // Detect wrap-around (position jumps from ~4095 to ~0)
-    if (servo3LastPos > 3000 && currentPos < 1000)
+    // Check if close to target
+    if (abs(servo3TotalPos - SERVO3_TARGET) < 100 || millis() - servo3StartTime > 10000)
     {
-      servo3RotationCount++;
-      Serial.print("Servo 3: Rotation ");
-      Serial.println(servo3RotationCount);
-
-      // After full rotations, record position for extra steps
-      if (servo3RotationCount == SERVO3_ROTATIONS)
-      {
-        servo3ExtraStartPos = currentPos;
-      }
-    }
-    servo3LastPos = currentPos;
-
-    // Check if full rotations + extra steps complete
-    if (servo3RotationCount >= SERVO3_ROTATIONS)
-    {
-      int extraMoved = (currentPos - servo3ExtraStartPos + 4096) % 4096;
-      if (extraMoved >= SERVO3_EXTRA_STEPS || SERVO3_EXTRA_STEPS == 0)
-      {
-        sts.WriteSpe(SERVO3_ID, 0, SERVO_ACC);
-        servo3Phase = 4;
-        servo3StartTime = millis();
-        Serial.println("Servo 3: Waiting 2sec");
-      }
+      servo3Phase = 4;
+      servo3StartTime = millis();
+      Serial.print("Servo 3: At target, TotalPos=");
+      Serial.print(servo3TotalPos);
+      Serial.println(", waiting...");
     }
   }
 
   // Servo 3: Wait phase (phase 4)
   if (servo3Phase == 4 && millis() - servo3StartTime >= SERVO3_WAIT_TIME)
   {
-    // Start reverse rotation
-    servo3RotationCount = 0;
-    servo3LastPos = sts.ReadPos(SERVO3_ID);
-    servo3ExtraStartPos = servo3LastPos; // For extra steps tracking
-    sts.WriteSpe(SERVO3_ID, -SERVO3_RUN_SPEED, SERVO_ACC);
+    // Return to origin
+    moveSteps(SERVO3_ID, -servo3TotalPos, SERVO3_MOVE_SPEED, SERVO_ACC);
     servo3Phase = 5;
     servo3StartTime = millis();
-    Serial.println("Servo 3: Reverse");
+    Serial.print("Servo 3: Returning to origin from ");
+    Serial.println(servo3TotalPos);
   }
 
-  // Servo 3: Count rotations during reverse (phase 5)
-  // Reverse 1 less rotation, then re-home will bring it back slowly
+  // Servo 3: Wait for return to complete (phase 5)
   if (servo3Phase == 5)
   {
-    int currentPos = sts.ReadPos(SERVO3_ID);
-    // Detect wrap-around (position jumps from ~0 to ~4095)
-    if (servo3LastPos < 1000 && currentPos > 3000)
+    // Check if close to origin
+    if (abs(servo3TotalPos) < 100 || millis() - servo3StartTime > 10000)
     {
-      servo3RotationCount++;
-      Serial.print("Servo 3: Reverse rotation ");
-      Serial.println(servo3RotationCount);
+      servo3Phase = 0;
+      Serial.print("Servo 3: Back at origin, TotalPos=");
+      Serial.println(servo3TotalPos);
     }
-    servo3LastPos = currentPos;
-
-    // Stop after (SERVO3_ROTATIONS - 1) rotations, let re-home do the rest
-    if (servo3RotationCount >= SERVO3_ROTATIONS - 1)
-    {
-      // Stop and wait before re-home
-      sts.WriteSpe(SERVO3_ID, 0, SERVO_ACC);
-      servo3Phase = 6;
-      servo3StartTime = millis();
-      Serial.println("Servo 3: Waiting before re-home");
-    }
-  }
-
-  // Servo 3: Wait before re-home (phase 6)
-  if (servo3Phase == 6 && millis() - servo3StartTime >= 1000)
-  {
-    servo3Home();
-    Serial.println("Servo 3: Re-homing");
   }
 
   // Load monitoring every 200ms
@@ -395,12 +454,11 @@ void loop()
     lastLoadCheck = millis();
     int servoIds[] = {SERVO1_ID, SERVO2_ID, SERVO3_ID};
 
-    // Show Servo 3 position info
-    int servo3Pos = sts.ReadPos(SERVO3_ID);
-    Serial.print("S3: Pos=");
-    Serial.print(servo3Pos);
-    Serial.print(" Home=");
-    Serial.print(servo3HomePos);
+    // Show position info
+    Serial.print("S1: TotalPos=");
+    Serial.print(servo1TotalPos);
+    Serial.print(" | S3: TotalPos=");
+    Serial.print(servo3TotalPos);
     Serial.print(" Phase=");
     Serial.print(servo3Phase);
     Serial.print(" | Load: ");
@@ -411,30 +469,15 @@ void loop()
       Serial.print("=");
       Serial.print(load);
       Serial.print(" ");
-      // Servo 3: Check load to trigger forward rotation
+      // Servo 3: Check load to trigger forward rotation (homing phase 1)
       if (i == 2 && servo3Phase == 1 && abs(load) > SERVO3_LOAD_LIMIT)
       {
         servo3Phase = 2;
         servo3StartTime = millis();
         sts.WriteSpe(SERVO3_ID, SERVO3_INIT_SPEED, SERVO_ACC);
         Serial.println();
-        Serial.println("*** Servo 3: Load triggered, Forward 1000ms ***");
+        Serial.println("*** Servo 3: Load triggered, Forward ***");
       }
-      // Servo 1: Overload protection (skip Servo 2)
-      else if (i == 0 && abs(load) > LOAD_LIMIT)
-      {
-        servoOverLoad[i] = true;
-        overLoadDirection[i] = (load > 0) ? 1 : -1; // Record direction
-        sts.WriteSpe(servoIds[i], 0, SERVO_ACC);
-        Serial.println();
-        Serial.print("*** Servo ");
-        Serial.print(servoIds[i]);
-        Serial.print(" OVER LOAD STOP! Load=");
-        Serial.print(load);
-        Serial.println(" ***");
-        prevSpeed1 = 0;
-      }
-      // Note: overload flag is reset only when joystick returns to center (speed == 0)
     }
     Serial.println();
   }

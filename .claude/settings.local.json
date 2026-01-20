@@ -7,7 +7,9 @@
       "WebFetch(domain:registry.platformio.org)",
       "Bash(pio run:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "Bash(git init:*)"
+      "Bash(git init:*)",
+      "Bash(gh repo edit:*)",
+      "Bash(git checkout:*)"
     ]
   }
 }
