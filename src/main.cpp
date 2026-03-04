@@ -92,16 +92,23 @@ unsigned long servo1HomingStartTime = 0;
 // Servo 3 state:
 // 0=idle, 1=reverse(homing), 2=forward(homing complete)
 // 3=moving to target, 4=wait at target, 5=returning to origin
+// 6=wait at origin (auto-repeat)
 int servo3Phase = 0;
 unsigned long servo3StartTime = 0;
 long servo3TotalPos = 0;
 int servo3LastPos = 0;
-bool servo3Moving = false; // True while servo is moving (load > threshold)
+bool servo3Moving = false;                // True while servo is moving (load > threshold)
+bool servo3AutoRepeat = false;            // Auto-repeat mode
+bool servo3CancelRequested = false;       // Cancel requested (finish current cycle then stop)
+unsigned long servo3JoyBtnPressStart = 0; // Button press start time
+bool servo3LongPressDetected = false;     // Long press detected flag
 #define SERVO3_INIT_SPEED 500
 #define SERVO3_LOAD_LIMIT 300
 #define SERVO3_MOVE_LOAD_THRESHOLD 50 // Load threshold to detect movement
 #define SERVO3_FORWARD_TIME 1000      // ms (homing forward time)
-#define SERVO3_WAIT_TIME 2000         // ms (wait time at target)
+#define SERVO3_TARGET_WAIT_TIME 5000  // ms (wait time at target)
+#define SERVO3_ORIGIN_WAIT_TIME 5000  // ms (wait time at origin, auto-repeat)
+#define SERVO3_LONG_PRESS_TIME 1000   // ms (long press threshold)
 
 // Load monitoring state
 unsigned long lastLoadCheck = 0;
@@ -600,28 +607,58 @@ void loop()
   // Servo 3: Joystick button triggers movement sequence
   // Block if any other action is happening (buttons pressed, joystick not centered)
   bool anyActivity = buttonPressed || !fullyAtCenter || (speed2 != 0);
-  if (servo3Phase == 0 && joystick.get_button_value() == 0 && !anyActivity)
+  bool joyBtnPressed = (joystick.get_button_value() == 0);
+
+  if (servo3Phase == 0 && joyBtnPressed && !anyActivity)
   {
     // Move to target position using position control
     moveSteps(SERVO3_ID, SERVO3_TARGET, SERVO3_SPEED, SERVO_ACC);
     servo3Phase = 3;
-    servo3Moving = false; // Wait for load to rise before detecting completion
+    servo3Moving = false;
     servo3StartTime = millis();
+    servo3JoyBtnPressStart = millis();
+    servo3LongPressDetected = false;
+    servo3CancelRequested = false;
+    servo3AutoRepeat = false;
     Serial.print("Servo 3: Moving to ");
     Serial.println(SERVO3_TARGET);
   }
 
+  // Long press detection during sequence (phase 3/4/5)
+  if (servo3Phase >= 3 && servo3Phase <= 5 && !servo3LongPressDetected)
+  {
+    if (joyBtnPressed)
+    {
+      if (servo3JoyBtnPressStart == 0)
+        servo3JoyBtnPressStart = millis();
+      else if (millis() - servo3JoyBtnPressStart >= SERVO3_LONG_PRESS_TIME)
+      {
+        servo3AutoRepeat = true;
+        servo3LongPressDetected = true;
+        Serial.println("Servo 3: Auto-repeat enabled (long press)");
+      }
+    }
+    else
+    {
+      servo3JoyBtnPressStart = 0;
+    }
+  }
+
+  // Cancel: btn1 (GPIO3) + joystick button during sequence
+  // Sets flag to stop after current cycle completes (no mid-movement stop)
+  if (((servo3Phase >= 3 && servo3Phase <= 5) || servo3Phase == 6) && btn1Pressed && joyBtnPressed && !servo3CancelRequested)
+  {
+    servo3CancelRequested = true;
+    servo3AutoRepeat = false;
+    Serial.println("Servo 3: Cancel requested (will finish current cycle)");
+  }
+
   // Servo 3: Wait for movement to complete (phase 3)
-  // Detect completion when load drops below threshold
   if (servo3Phase == 3)
   {
     int load3 = abs(sts.ReadLoad(SERVO3_ID));
-    // Once we see high load, we're moving
     if (load3 > SERVO3_MOVE_LOAD_THRESHOLD)
-    {
       servo3Moving = true;
-    }
-    // If we were moving and now load is low, movement complete
     if (servo3Moving && load3 < SERVO3_MOVE_LOAD_THRESHOLD)
     {
       servo3Phase = 4;
@@ -631,32 +668,62 @@ void loop()
   }
 
   // Servo 3: Wait phase (phase 4)
-  if (servo3Phase == 4 && millis() - servo3StartTime >= SERVO3_WAIT_TIME)
+  if (servo3Phase == 4)
   {
-    // Return to origin - use SERVO3_TARGET instead of tracked position
-    moveSteps(SERVO3_ID, -SERVO3_TARGET, SERVO3_SPEED, SERVO_ACC);
-    servo3Phase = 5;
-    servo3Moving = false; // Wait for load to rise before detecting completion
-    servo3StartTime = millis();
-    Serial.println("Servo 3: Returning to origin");
+    // If cancel requested, skip wait and return immediately
+    bool waitDone = (millis() - servo3StartTime >= SERVO3_TARGET_WAIT_TIME);
+    if (waitDone || servo3CancelRequested)
+    {
+      moveSteps(SERVO3_ID, -SERVO3_TARGET, SERVO3_SPEED, SERVO_ACC);
+      servo3Phase = 5;
+      servo3Moving = false;
+      servo3StartTime = millis();
+      Serial.println(servo3CancelRequested ? "Servo 3: Cancel - returning to origin" : "Servo 3: Returning to origin");
+    }
   }
 
   // Servo 3: Wait for return to complete (phase 5)
-  // Detect completion when load drops below threshold
   if (servo3Phase == 5)
   {
     int load3 = abs(sts.ReadLoad(SERVO3_ID));
     if (load3 > SERVO3_MOVE_LOAD_THRESHOLD)
-    {
       servo3Moving = true;
-    }
     if (servo3Moving && load3 < SERVO3_MOVE_LOAD_THRESHOLD)
     {
-      servo3Phase = 0;
       servo3Moving = false;
       servo3TotalPos = 0;
       servo3LastPos = sts.ReadPos(SERVO3_ID);
-      Serial.println("Servo 3: Back at origin");
+      if (servo3AutoRepeat && !servo3CancelRequested)
+      {
+        servo3Phase = 6;
+        servo3StartTime = millis();
+        Serial.println("Servo 3: At origin, waiting (auto-repeat)");
+      }
+      else
+      {
+        servo3Phase = 0;
+        servo3CancelRequested = false;
+        Serial.println("Servo 3: Back at origin");
+      }
+    }
+  }
+
+  // Servo 3: Wait at origin for auto-repeat (phase 6)
+  if (servo3Phase == 6)
+  {
+    if (servo3CancelRequested)
+    {
+      servo3Phase = 0;
+      servo3CancelRequested = false;
+      Serial.println("Servo 3: Cancelled at origin");
+    }
+    else if (millis() - servo3StartTime >= SERVO3_ORIGIN_WAIT_TIME)
+    {
+      moveSteps(SERVO3_ID, SERVO3_TARGET, SERVO3_SPEED, SERVO_ACC);
+      servo3Phase = 3;
+      servo3Moving = false;
+      servo3StartTime = millis();
+      Serial.println("Servo 3: Auto-repeat - moving to target");
     }
   }
 
