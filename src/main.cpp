@@ -2,7 +2,6 @@
 #include <Wire.h>
 #include <SCServo.h>
 #include <m5_unit_joystick2.hpp>
-#include <Preferences.h>
 
 // Serial pins for STS3215 communication
 #define STS_TX_PIN 15
@@ -54,7 +53,6 @@
 
 SMS_STS sts;
 M5UnitJoystick2 joystick;
-Preferences preferences;
 
 // Previous speed to detect changes
 int16_t prevSpeed2 = 0;
@@ -87,11 +85,9 @@ long servo1CommandedPos = 0;        // Cumulative commanded position (for limit 
 // 0=done, 1=forward(homing), 2=reverse(after load), 3=moving to saved origin
 int servo1HomingPhase = 0;
 unsigned long servo1HomingStartTime = 0;
-bool servo1HomingMoving = false; // For phase 3 movement detection
 #define SERVO1_INIT_SPEED 500
-#define SERVO1_HOMING_LOAD_LIMIT 300  // Same as SERVO3 for initial testing
-#define SERVO1_FORWARD_TIME 1000      // ms (homing forward time)
-#define SERVO1_MOVE_LOAD_THRESHOLD 50 // Load threshold to detect movement
+#define SERVO1_HOMING_LOAD_LIMIT 300 // Same as SERVO3 for initial testing
+#define SERVO1_FORWARD_TIME 1300     // ms (homing forward time)
 
 // Servo 3 state:
 // 0=idle, 1=reverse(homing), 2=forward(homing complete)
@@ -247,9 +243,6 @@ void setup()
   Serial.begin(115200);
   Serial.println("STS3215 Joystick2 Controller");
 
-  // Initialize Preferences (flash storage)
-  preferences.begin("servo", false);
-
   // Initialize PWM Servo
   if (ledcAttach(PWM_SERVO_PIN, 50, 14)) // 50Hz, 14-bit resolution
   {
@@ -367,14 +360,12 @@ void loop()
     }
     else if (millis() - bothButtonsStart >= ORIGIN_SET_HOLD_TIME)
     {
-      // Set current position as origin and save to flash
+      // Set current position as origin
       servo1Origin = servo1TotalPos;
       servo1CommandedPos = servo1TotalPos; // Initialize commanded position
       servo1OriginSet = true;
-      preferences.putLong("s1origin", servo1Origin);
-      preferences.putBool("s1originSet", true);
       bothButtonsHeld = false; // Reset to avoid repeated triggering
-      Serial.print("Servo 1: Origin set and saved at ");
+      Serial.print("Servo 1: Origin set at ");
       Serial.println(servo1Origin);
     }
   }
@@ -428,48 +419,11 @@ void loop()
 
     servo1LastPos = sts.ReadPos(SERVO1_ID);
     servo1TotalPos = 0;
-
-    // Check for saved origin position
-    long savedOrigin = preferences.getLong("s1origin", 0);
-    bool hasSavedOrigin = preferences.getBool("s1originSet", false);
-
-    if (hasSavedOrigin && savedOrigin != 0)
-    {
-      // Move to saved origin position
-      moveSteps(SERVO1_ID, savedOrigin, SERVO1_SPEED_MAX, SERVO_ACC);
-      servo1HomingPhase = 3;
-      servo1HomingMoving = false;
-      Serial.print("Servo 1: Moving to saved origin ");
-      Serial.println(savedOrigin);
-    }
-    else
-    {
-      servo1CommandedPos = 0;
-      servo1Origin = 0;
-      servo1OriginSet = true;
-      servo1HomingPhase = 0;
-      Serial.println("Servo 1: Homing complete, no saved origin");
-    }
-  }
-
-  // Servo 1: Moving to saved origin (phase 3)
-  if (servo1HomingPhase == 3)
-  {
-    int load1 = abs(sts.ReadLoad(SERVO1_ID));
-    if (load1 > SERVO1_MOVE_LOAD_THRESHOLD)
-    {
-      servo1HomingMoving = true;
-    }
-    if (servo1HomingMoving && load1 < SERVO1_MOVE_LOAD_THRESHOLD)
-    {
-      long savedOrigin = preferences.getLong("s1origin", 0);
-      servo1Origin = savedOrigin;
-      servo1CommandedPos = savedOrigin;
-      servo1TotalPos = savedOrigin;
-      servo1OriginSet = true;
-      servo1HomingPhase = 0;
-      Serial.println("Servo 1: At saved origin, homing complete");
-    }
+    servo1CommandedPos = 0;
+    servo1Origin = 0;
+    servo1OriginSet = true;
+    servo1HomingPhase = 0;
+    Serial.println("Servo 1: Homing complete, origin set");
   }
 
   // SERVO1: X axis position control (skip during homing)
