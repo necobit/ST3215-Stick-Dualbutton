@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <SCServo.h>
 #include <m5_unit_joystick2.hpp>
+#include <Preferences.h>
 
 // Serial pins for STS3215 communication
 #define STS_TX_PIN 15
@@ -53,6 +54,7 @@
 
 SMS_STS sts;
 M5UnitJoystick2 joystick;
+Preferences preferences;
 
 // Previous speed to detect changes
 int16_t prevSpeed2 = 0;
@@ -80,6 +82,16 @@ unsigned long bothButtonsStart = 0; // When both buttons started being held
 bool bothButtonsHeld = false;       // True when both buttons are being held
 #define ORIGIN_SET_HOLD_TIME 3000   // 3 seconds to set origin
 long servo1CommandedPos = 0;        // Cumulative commanded position (for limit tracking)
+
+// SERVO1 homing state
+// 0=done, 1=forward(homing), 2=reverse(after load), 3=moving to saved origin
+int servo1HomingPhase = 0;
+unsigned long servo1HomingStartTime = 0;
+bool servo1HomingMoving = false; // For phase 3 movement detection
+#define SERVO1_INIT_SPEED 500
+#define SERVO1_HOMING_LOAD_LIMIT 300  // Same as SERVO3 for initial testing
+#define SERVO1_FORWARD_TIME 1000      // ms (homing forward time)
+#define SERVO1_MOVE_LOAD_THRESHOLD 50 // Load threshold to detect movement
 
 // Servo 3 state:
 // 0=idle, 1=reverse(homing), 2=forward(homing complete)
@@ -178,6 +190,14 @@ long clampServo1Movement(long requestedSteps)
   return requestedSteps;
 }
 
+// Servo 1 home return (原点復帰)
+void servo1Home()
+{
+  servo1HomingPhase = 1;
+  sts.WriteSpe(SERVO1_ID, SERVO1_INIT_SPEED, SERVO_ACC);
+  Serial.println("Servo 1: Homing (reverse, waiting for load)");
+}
+
 // Servo 3 home return (原点復帰)
 void servo3Home()
 {
@@ -226,6 +246,9 @@ void setup()
 {
   Serial.begin(115200);
   Serial.println("STS3215 Joystick2 Controller");
+
+  // Initialize Preferences (flash storage)
+  preferences.begin("servo", false);
 
   // Initialize PWM Servo
   if (ledcAttach(PWM_SERVO_PIN, 50, 14)) // 50Hz, 14-bit resolution
@@ -280,16 +303,15 @@ void setup()
     delay(50);
   }
 
-  // Disable angle limits and set Mode 3 for SERVO1 only
-  // SERVO3 will be set to Mode 3 after homing completes
-  Serial.println("Servo 1: Setting up multi-turn position control...");
+  // SERVO1: Disable angle limits, keep wheel mode for homing
+  Serial.println("Servo 1: Disabling angle limits (wheel mode for homing)...");
   sts.unLockEprom(SERVO1_ID);
   sts.writeByte(SERVO1_ID, 9, 0);  // Min angle limit low byte
   sts.writeByte(SERVO1_ID, 10, 0); // Min angle limit high byte
   sts.writeByte(SERVO1_ID, 11, 0); // Max angle limit low byte
   sts.writeByte(SERVO1_ID, 12, 0); // Max angle limit high byte
   sts.LockEprom(SERVO1_ID);
-  sts.writeByte(SERVO1_ID, 33, 3); // Mode 3 (Step mode)
+  sts.WheelMode(SERVO1_ID); // Keep wheel mode for homing
   delay(50);
 
   // SERVO3: Disable angle limits but stay in wheel mode for homing
@@ -323,7 +345,8 @@ void setup()
     Serial.println(pos);
   }
 
-  // Servo 3 home return
+  // Servo 1 & 3 home return
+  servo1Home();
   servo3Home();
 
   Serial.println("Initialization complete");
@@ -344,12 +367,14 @@ void loop()
     }
     else if (millis() - bothButtonsStart >= ORIGIN_SET_HOLD_TIME)
     {
-      // Set current position as origin
+      // Set current position as origin and save to flash
       servo1Origin = servo1TotalPos;
       servo1CommandedPos = servo1TotalPos; // Initialize commanded position
       servo1OriginSet = true;
+      preferences.putLong("s1origin", servo1Origin);
+      preferences.putBool("s1originSet", true);
       bothButtonsHeld = false; // Reset to avoid repeated triggering
-      Serial.print("Servo 1: Origin set at ");
+      Serial.print("Servo 1: Origin set and saved at ");
       Serial.println(servo1Origin);
     }
   }
@@ -386,7 +411,68 @@ void loop()
   // Check button state (use already-read values)
   bool buttonPressed = btn1Pressed || btn2Pressed;
 
-  // SERVO1: X axis position control
+  // Servo 1: Homing forward complete (phase 2) - switch to position mode
+  if (servo1HomingPhase == 2 && millis() - servo1HomingStartTime >= SERVO1_FORWARD_TIME)
+  {
+    sts.WriteSpe(SERVO1_ID, 0, SERVO_ACC);
+    delay(100);
+
+    // Set current position as origin (0)
+    sts.CalibrationOfs(SERVO1_ID);
+    delay(50);
+
+    // Switch to Mode 3 (Step mode) for position control
+    sts.writeByte(SERVO1_ID, 33, 3);
+    delay(50);
+    Serial.println("Servo 1: Switched to position mode (Mode 3)");
+
+    servo1LastPos = sts.ReadPos(SERVO1_ID);
+    servo1TotalPos = 0;
+
+    // Check for saved origin position
+    long savedOrigin = preferences.getLong("s1origin", 0);
+    bool hasSavedOrigin = preferences.getBool("s1originSet", false);
+
+    if (hasSavedOrigin && savedOrigin != 0)
+    {
+      // Move to saved origin position
+      moveSteps(SERVO1_ID, savedOrigin, SERVO1_SPEED_MAX, SERVO_ACC);
+      servo1HomingPhase = 3;
+      servo1HomingMoving = false;
+      Serial.print("Servo 1: Moving to saved origin ");
+      Serial.println(savedOrigin);
+    }
+    else
+    {
+      servo1CommandedPos = 0;
+      servo1Origin = 0;
+      servo1OriginSet = true;
+      servo1HomingPhase = 0;
+      Serial.println("Servo 1: Homing complete, no saved origin");
+    }
+  }
+
+  // Servo 1: Moving to saved origin (phase 3)
+  if (servo1HomingPhase == 3)
+  {
+    int load1 = abs(sts.ReadLoad(SERVO1_ID));
+    if (load1 > SERVO1_MOVE_LOAD_THRESHOLD)
+    {
+      servo1HomingMoving = true;
+    }
+    if (servo1HomingMoving && load1 < SERVO1_MOVE_LOAD_THRESHOLD)
+    {
+      long savedOrigin = preferences.getLong("s1origin", 0);
+      servo1Origin = savedOrigin;
+      servo1CommandedPos = savedOrigin;
+      servo1TotalPos = savedOrigin;
+      servo1OriginSet = true;
+      servo1HomingPhase = 0;
+      Serial.println("Servo 1: At saved origin, homing complete");
+    }
+  }
+
+  // SERVO1: X axis position control (skip during homing)
   // Update total position tracking
   int servo1CurrentPos = sts.ReadPos(SERVO1_ID);
   updateTotalPos(SERVO1_ID, servo1CurrentPos, servo1LastPos, servo1TotalPos);
@@ -418,7 +504,7 @@ void loop()
     servo1MaxCount = 0;
     // Note: Don't sync commandedPos here - it would bypass limit protection
   }
-  else if (!servo1MaxTriggered && !buttonPressed && !yAxisActive)
+  else if (!servo1MaxTriggered && !buttonPressed && !yAxisActive && servo1HomingPhase == 0)
   {
     if (atMaxRight)
     {
@@ -479,6 +565,24 @@ void loop()
         }
         servo1HoldStart = millis(); // Reset for continuous slow movement
       }
+    }
+  }
+
+  // Debug: show why servo1 control is blocked
+  if (!atCenterX && servo1HomingPhase == 0)
+  {
+    static unsigned long lastS1Debug = 0;
+    if (millis() - lastS1Debug > 500)
+    {
+      Serial.print("S1_DBG: maxTrig=");
+      Serial.print(servo1MaxTriggered);
+      Serial.print(" btn=");
+      Serial.print(buttonPressed);
+      Serial.print(" yAct=");
+      Serial.print(yAxisActive);
+      Serial.print(" X=");
+      Serial.println(adc_x);
+      lastS1Debug = millis();
     }
   }
 
@@ -623,6 +727,15 @@ void loop()
       Serial.print("=");
       Serial.print(load);
       Serial.print(" ");
+      // Servo 1: Check load to trigger forward rotation (homing phase 1)
+      if (i == 0 && servo1HomingPhase == 1 && abs(load) > SERVO1_HOMING_LOAD_LIMIT)
+      {
+        servo1HomingPhase = 2;
+        servo1HomingStartTime = millis();
+        sts.WriteSpe(SERVO1_ID, -SERVO1_INIT_SPEED, SERVO_ACC);
+        Serial.println();
+        Serial.println("*** Servo 1: Load triggered, Reverse ***");
+      }
       // Servo 3: Check load to trigger forward rotation (homing phase 1)
       if (i == 2 && servo3Phase == 1 && abs(load) > SERVO3_LOAD_LIMIT)
       {
