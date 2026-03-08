@@ -403,6 +403,12 @@ void loop()
   // Read joystick ADC values (16-bit)
   joystick.get_joy_adc_16bits_value_xy(&adc_x, &adc_y);
 
+  // Ignore X axis when angle buttons are pressed (Y axis still active)
+  if (btn1Pressed || btn2Pressed)
+  {
+    adc_x = JOY_CENTER;
+  }
+
   // SERVO2: Y axis speed control (wheel mode)
   int16_t speed2 = mapJoystickToSpeed(adc_y, SERVO2_SPEED_MAX);
 

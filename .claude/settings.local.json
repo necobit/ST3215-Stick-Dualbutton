@@ -9,7 +9,14 @@
       "WebFetch(domain:raw.githubusercontent.com)",
       "Bash(git init:*)",
       "Bash(gh repo edit:*)",
-      "Bash(git checkout:*)"
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Skill(serial-log)",
+      "Skill(serial-stop)",
+      "Bash(wc -l /tmp/serial_log.txt && tmux has-session -t serial-monitor 2>/dev/null && echo \"session alive\" || echo \"no session\")",
+      "Bash(bash /tmp/start_serial_monitor.sh)"
     ]
   }
 }
